@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>AR Pinch Prototype</title>
+
+<link rel="manifest" href="manifest.json" />
+<meta name="theme-color" content="#111114" />
+<meta name="mobile-web-app-capable" content="yes" />
+<link rel="icon" href="icon-192.png" />
+<link rel="apple-touch-icon" href="icon-192.png" />
+<style>
+  html, body { margin: 0; padding: 0; overflow: hidden; height: 100%; background: #000; }
+  #overlay {
+    position: fixed; inset: 0; z-index: 10;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    font-family: -apple-system, system-ui, sans-serif; color: #fff; text-align: center;
+    background: rgba(0,0,0,0.55); padding: 24px; box-sizing: border-box;
+  }
+  #overlay.hidden { display: none; }
+  #startBtn {
+    margin-top: 20px; padding: 14px 28px; font-size: 17px; border-radius: 999px;
+    border: none; background: #ffffff; color: #000; font-weight: 600;
+  }
+  #status {
+    position: fixed; top: env(safe-area-inset-top, 0px); left: 0; right: 0; z-index: 20;
+    font-family: -apple-system, system-ui, sans-serif; font-size: 12px; color: #0f0;
+    background: rgba(0,0,0,0.5); padding: 6px 10px; white-space: pre-wrap;
+    pointer-events: none;
+  }
+  #dbgCanvas {
+    position: fixed; bottom: 8px; right: 8px; width: 120px; height: 90px;
+    border: 1px solid rgba(255,255,255,0.4); z-index: 20; background: #111;
+  }
+</style>
+</head>
+<body>
+
+<div id="overlay">
+  <h2>AR Pinch Prototype</h2>
+  <p>
+    Point your rear camera at a flat surface. A cube will appear once a plane
+    is found. Reach your other hand into frame and pinch (thumb + index) near
+    the cube to grab it.
+  </p>
+  <p id="support" style="opacity:0.8; font-size: 13px;">Checking device support…</p>
+  <button id="startBtn" disabled>Start AR</button>
+</div>
+
+<div id="status" class="hidden"></div>
+<canvas id="dbgCanvas" class="hidden"></canvas>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.164.1/three.module.min.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from "three";
+import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const overlay = document.getElementById("overlay");
+const supportEl = document.getElementById("support");
+const startBtn = document.getElementById("startBtn");
+const statusEl = document.getElementById("status");
+const dbgCanvas = document.getElementById("dbgCanvas");
+const dbgCtx = dbgCanvas.getContext("2d");
+
+let renderer, scene, camera, xrSession, xrRefSpace, hitTestSource;
+let reticle, targetCube, handMarker;
+let handLandmarker = null;
+let glBinding = null; // XRWebGLBinding, for raw camera texture access
+let readbackCanvas, readbackCtx;
+let frameCounter = 0;
+const HAND_DETECT_EVERY_N_FRAMES = 3; // throttle the texture readback
+
+function log(msg) {
+  statusEl.classList.remove("hidden");
+  statusEl.textContent = msg;
+  console.log("[AR]", msg);
+}
+
+// --- Feature detection -------------------------------------------------
+
+async function checkSupport() {
+  if (!("xr" in navigator)) {
+    supportEl.textContent = "WebXR is not available in this browser. Use Chrome on an ARCore-capable Android phone.";
+    return false;
+  }
+  const arOk = await navigator.xr.isSessionSupported("immersive-ar");
+  if (!arOk) {
+    supportEl.textContent = "This device/browser doesn't support immersive-ar.";
+    return false;
+  }
+  supportEl.textContent = "Device supports WebXR AR. Tap Start AR, then grant camera access when prompted (you'll see two prompts: one for AR tracking, one for raw camera pixels).";
+  startBtn.disabled = false;
+  return true;
+}
+
+// --- Three.js scene setup ----------------------------------------------
+
+function initScene() {
+  scene = new THREE.Scene();
+  camera = new THREE.PerspectiveCamera();
+
+  renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.xr.enabled = true;
+  document.body.appendChild(renderer.domElement);
+
+  const light = new THREE.HemisphereLight(0xffffff, 0x444444, 1.2);
+  scene.add(light);
+
+  // Reticle shown while searching for a plane to place the cube on
+  reticle = new THREE.Mesh(
+    new THREE.RingGeometry(0.06, 0.08, 32).rotateX(-Math.PI / 2),
+    new THREE.MeshBasicMaterial({ color: 0x00ff88 })
+  );
+  reticle.matrixAutoUpdate = false;
+  reticle.visible = false;
+  scene.add(reticle);
+
+  // The pinchable object
+  targetCube = new THREE.Mesh(
+    new THREE.BoxGeometry(0.12, 0.12, 0.12),
+    new THREE.MeshStandardMaterial({ color: 0xff5533 })
+  );
+  targetCube.visible = false;
+  scene.add(targetCube);
+
+  // Small marker showing the tracked pinch point, projected into 3D space
+  // in front of the camera (approximate — see notes in README below).
+  handMarker = new THREE.Mesh(
+    new THREE.SphereGeometry(0.015, 16, 16),
+    new THREE.MeshBasicMaterial({ color: 0x3388ff })
+  );
+  handMarker.visible = false;
+  scene.add(handMarker);
+}
+
+// --- MediaPipe hand landmarker ------------------------------------------
+
+async function initHandLandmarker() {
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  handLandmarker = await HandLandmarker.createFromOptions(fileset, {
+    baseOptions: {
+      modelAssetPath:
+        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate: "GPU"
+    },
+    runningMode: "VIDEO",
+    numHands: 1
+  });
+  log("Hand landmarker ready.");
+}
+
+// Pinch = distance between thumb tip (4) and index tip (8) below a threshold,
+// normalized by hand size (wrist-to-middle-mcp) so it's roughly scale-invariant.
+function isPinching(landmarks) {
+  const thumbTip = landmarks[4];
+  const indexTip = landmarks[8];
+  const wrist = landmarks[0];
+  const middleMcp = landmarks[9];
+
+  const dx = thumbTip.x - indexTip.x;
+  const dy = thumbTip.y - indexTip.y;
+  const dz = thumbTip.z - indexTip.z;
+  const pinchDist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+  const hx = wrist.x - middleMcp.x;
+  const hy = wrist.y - middleMcp.y;
+  const hz = wrist.z - middleMcp.z;
+  const handScale = Math.sqrt(hx * hx + hy * hy + hz * hz) || 0.1;
+
+  return pinchDist / handScale < 0.35;
+}
+
+// --- XR session -----------------------------------------------------------
+
+async function startAR() {
+  overlay.classList.add("hidden");
+  initScene();
+  await initHandLandmarker();
+
+  let session;
+  try {
+    session = await navigator.xr.requestSession("immersive-ar", {
+      requiredFeatures: ["hit-test", "local-floor"],
+      // camera-access is the raw-pixel feature; optional so the session still
+      // starts (without hand tracking) on devices/Chrome versions that lack it.
+      optionalFeatures: ["camera-access", "dom-overlay", "plane-detection"],
+      domOverlay: { root: document.body }
+    });
+  } catch (err) {
+    log("Failed to start AR session: " + err.message);
+    return;
+  }
+
+  xrSession = session;
+  renderer.xr.setReferenceSpaceType("local-floor");
+  await renderer.xr.setSession(session);
+
+  xrRefSpace = renderer.xr.getReferenceSpace();
+  const viewerSpace = await session.requestReferenceSpace("viewer");
+  hitTestSource = await session.requestHitTestSource({ space: viewerSpace });
+
+  // Try to get a WebGLBinding for raw camera texture access. This is the
+  // "camera-access" feature — same physical camera the AR session already
+  // uses for plane detection, exposed to us as a pose-synced GL texture.
+  try {
+    const gl = renderer.getContext();
+    glBinding = new XRWebGLBinding(session, gl);
+    readbackCanvas = document.createElement("canvas");
+    readbackCanvas.width = 256;
+    readbackCanvas.height = 192;
+    readbackCtx = readbackCanvas.getContext("2d", { willReadFrequently: true });
+    log("Raw camera access acquired — hand tracking active.");
+  } catch (err) {
+    glBinding = null;
+    log("Raw camera access unavailable on this device (" + err.message + "). AR/plane detection will still work; hand tracking is disabled. Falling back would require a device with camera-access support.");
+  }
+
+  session.addEventListener("end", onSessionEnd);
+  renderer.setAnimationLoop(onXRFrame);
+}
+
+function onSessionEnd() {
+  renderer.setAnimationLoop(null);
+  xrSession = null;
+  overlay.classList.remove("hidden");
+}
+
+// Read back the AR camera texture for this frame into a small 2D canvas,
+// so MediaPipe (which wants a CPU-side image, not a raw GL texture) can
+// run its hand model on it.
+function grabCameraFrame(frame) {
+  if (!glBinding) return null;
+  const pose = frame.getViewerPose(xrRefSpace);
+  if (!pose) return null;
+
+  for (const view of pose.views) {
+    const cameraTex = glBinding.getCameraImage(view.camera);
+    if (!cameraTex) continue;
+
+    const gl = renderer.getContext();
+    // Bind the XR camera texture to a framebuffer and read its pixels down
+    // to a small canvas. Downscaling here is what keeps this affordable —
+    // don't read back at full camera resolution every frame.
+    const fb = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, cameraTex, 0);
+
+    // NOTE: reading a WebGL framebuffer into a 2D canvas efficiently
+    // generally goes through gl.readPixels + putImageData, or drawing the
+    // texture with a second GL pass into a small render target first. This
+    // scaffold keeps the plumbing visible; swap in a proper downsample pass
+    // once you're optimizing for frame time.
+    const pixels = new Uint8Array(view.camera.width * view.camera.height * 4);
+    gl.readPixels(0, 0, view.camera.width, view.camera.height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.deleteFramebuffer(fb);
+
+    return { pixels, width: view.camera.width, height: view.camera.height };
+  }
+  return null;
+}
+
+function runHandDetection(frameData, timestampMs) {
+  if (!frameData || !handLandmarker) return;
+
+  const { pixels, width, height } = frameData;
+  readbackCanvas.width = width;
+  readbackCanvas.height = height;
+  const imgData = new ImageData(new Uint8ClampedArray(pixels.buffer), width, height);
+  readbackCtx.putImageData(imgData, 0, 0);
+
+  // Mirror a downscaled preview into the debug canvas so you can see what
+  // the model is looking at while testing.
+  dbgCanvas.classList.remove("hidden");
+  const dctx = dbgCtx;
+  dctx.clearRect(0, 0, dbgCanvas.width, dbgCanvas.height);
+  dctx.drawImage(readbackCanvas, 0, 0, dbgCanvas.width, dbgCanvas.height);
+
+  const result = handLandmarker.detectForVideo(readbackCanvas, timestampMs);
+  if (result.landmarks && result.landmarks.length > 0) {
+    const landmarks = result.landmarks[0];
+    const pinching = isPinching(landmarks);
+
+    // Rough projection: place the marker in front of the camera based on
+    // index-tip 2D position + a fixed depth guess. Good enough to validate
+    // the pipeline; replace with a proper depth/hit-test based placement
+    // once this is working end to end.
+    const tip = landmarks[8];
+    handMarker.visible = true;
+    handMarker.position.set((tip.x - 0.5) * 0.4, (0.5 - tip.y) * 0.4, -0.4);
+    handMarker.position.applyMatrix4(camera.matrixWorld);
+    handMarker.material.color.set(pinching ? 0x00ff00 : 0x3388ff);
+
+    if (pinching && targetCube.visible) {
+      const dist = handMarker.position.distanceTo(targetCube.position);
+      if (dist < 0.15) {
+        targetCube.material.color.set(0x00ff00);
+        log("Pinch detected near cube — grabbed!");
+      }
+    }
+  } else {
+    handMarker.visible = false;
+  }
+}
+
+function onXRFrame(timestamp, frame) {
+  const session = frame.session;
+
+  // Plane/hit-test-based placement of the cube (uses ARCore's own tracking,
+  // independent of raw camera access).
+  if (hitTestSource && !targetCube.visible) {
+    const hitResults = frame.getHitTestResults(hitTestSource);
+    if (hitResults.length > 0) {
+      const hit = hitResults[0];
+      const pose = hit.getPose(xrRefSpace);
+      reticle.visible = true;
+      reticle.matrix.fromArray(pose.transform.matrix);
+
+      // Place the cube on first stable hit — tap-free for this prototype.
+      targetCube.position.setFromMatrixPosition(reticle.matrix);
+      targetCube.position.y += 0.08;
+      targetCube.visible = true;
+      reticle.visible = false;
+    }
+  }
+
+  // Throttled hand-tracking pass on the shared camera feed.
+  frameCounter++;
+  if (glBinding && frameCounter % HAND_DETECT_EVERY_N_FRAMES === 0) {
+    const frameData = grabCameraFrame(frame);
+    runHandDetection(frameData, performance.now());
+  }
+
+  renderer.render(scene, camera);
+}
+
+window.addEventListener("resize", () => {
+  if (renderer) renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+startBtn.addEventListener("click", startAR);
+checkSupport();
+
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("sw.js").catch((err) => {
+      console.warn("Service worker registration failed:", err);
+    });
+  });
+}
+</script>
+</body>
+</html>
