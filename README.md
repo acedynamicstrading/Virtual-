@@ -73,17 +73,40 @@ prototype with no address bar.
 - Point the phone at a flat surface (floor or table) until a cube appears.
 - Reach your free hand into the rear-camera view and pinch near the cube.
   The small blue/green sphere is the tracked pinch point (green = pinching).
+- A pale yellow wireframe sphere around the cube shows the actual grab
+  radius the game logic checks against — makes the invisible hitbox
+  visible instead of implied.
+- The bottom-left panel is a live debug HUD: whether a plane/hand is
+  currently found, the raw pinch ratio (vs. the 0.35 threshold), live
+  distance from the pinch point to the cube (vs. the grab radius), and
+  the per-frame hand-detection time in ms. Everything here reads the same
+  state the actual grab logic uses, so if the HUD says you should have
+  grabbed it and didn't, that's a real bug, not a stale/misleading number.
 - The bottom-right debug canvas mirrors what the hand model is actually
-  seeing — useful for confirming exposure/framing issues on your specific
-  phone rather than guessing blind.
+  seeing, with the 21 tracked landmarks drawn as dots and a line between
+  thumb tip and index tip (green when pinching) — useful for confirming
+  exposure/framing/tracking-quality issues on your specific phone rather
+  than guessing blind from the 3D view alone.
 
 ## Known rough edges (by design, for a first pass)
 
-- **Hand-marker 3D placement is approximate.** It projects the 2D pinch
-  point in front of the camera at a fixed depth rather than using real
-  depth data. Fine for validating detection; will need a proper approach
-  (depth API, or anchoring interaction to hit-test results instead of
-  raw 3D distance) before this feels right in the actual game.
+- **Hand-marker depth uses the placement plane, not general depth.** The
+  marker is placed by casting a ray from the camera through the fingertip
+  and intersecting it with the *one* real surface the cube was anchored
+  to (captured once from the hit-test pose). This is accurate right at
+  that surface, but it's not general-purpose depth sensing — reach your
+  hand somewhere that isn't roughly on that plane (e.g. holding it up at
+  head height, away from the floor) and the marker will project onto
+  where that plane *would* be, not onto your actual hand position. Real
+  depth (via the Depth API, where supported) is the next step once you
+  need interactions that aren't tied to a single known surface.
+- **Camera/render alignment is assumed, not verified per-device.** The
+  fingertip's normalized image coordinates are mapped straight to NDC on
+  the assumption that the raw camera texture shares the same FOV/aspect
+  as the rendered view (which the WebXR spec requires, but device
+  implementations can still vary slightly). If the marker feels
+  consistently offset from your real fingertip rather than just laggy,
+  this is the first thing to check.
 - **Texture readback path is unoptimized.** `gl.readPixels` on the main
   thread is the simplest way to prove the concept works; it's not what
   you'd ship. Once the pipeline is confirmed on your device, the next
@@ -93,6 +116,35 @@ prototype with no address bar.
   plane detection + hand tracking on a stationary test. Room-scale
   walking uses the same `local-floor` reference space and will layer on
   top of this once the camera-sharing pipeline is confirmed solid.
+
+## Iterating on this while installed as a PWA
+
+The service worker only re-checks for updates when **its own file's bytes
+change** — editing `index.html` alone doesn't trigger that check, so an
+already-installed PWA can keep serving an old cached page indefinitely
+even after you've pushed real fixes. If a change doesn't seem to be
+showing up on your phone, this is the first thing to suspect before
+assuming the code itself is wrong.
+
+**Every time you deploy a change while testing via the installed PWA**,
+bump the version string in `sw.js`:
+
+```js
+const CACHE_NAME = "ar-pinch-shell-v2"; // increment this each deploy
+```
+
+That one-line diff is what makes the browser notice the worker changed
+and re-fetch everything. Even then, expect to need **two closes/reopens**
+of the app — the first load after a deploy is still served by the old
+worker (it's already controlling the page), and the new one only takes
+over after that.
+
+**Faster loop for active development:** test in a normal Chrome tab
+(not the installed home-screen icon) while iterating — it's subject to
+the same service worker, but pulling to refresh / closing the tab
+fully is more reliably a clean reload than relaunching an installed
+PWA. Save PWA-icon testing for confirming things work end to end once
+a change is stable.
 
 ## If `camera-access` isn't supported on your device
 
