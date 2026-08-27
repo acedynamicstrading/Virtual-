@@ -50,8 +50,10 @@
   <h2>AR Pinch Prototype</h2>
   <p>
     Point your rear camera at a flat surface. A cube will appear once a plane
-    is found. Reach your other hand into frame and pinch (thumb + index) near
-    the cube to grab it.
+    is found, along with a pink ring on the floor — that ring, not the cube
+    itself, is where a pinch actually needs to land. Reach your other hand
+    into frame; an arrow will guide your fingertip to the ring, turning green
+    as you get close. Pinch (thumb + index) once it's green to grab.
   </p>
   <p id="support" style="opacity:0.8; font-size: 13px;">Checking device support…</p>
   <button id="startBtn" disabled>Start AR</button>
@@ -95,6 +97,8 @@ const HAND_DETECT_EVERY_N_FRAMES = 3; // throttle the texture readback
 let placementPlane = null;
 const handRaycaster = new THREE.Raycaster();
 const planeHitPoint = new THREE.Vector3();
+let targetRing = null; // marks the exact floor point a grab succeeds at
+let guideArrow = null; // points from the tracked fingertip to that spot
 
 // Debug metrics, refreshed each frame / each hand-detection pass. Kept as
 // plain state rather than recomputed inline so the HUD and the wireframe
@@ -173,6 +177,30 @@ function initScene() {
     new THREE.MeshBasicMaterial({ color: 0xffcc66, wireframe: true, transparent: true, opacity: 0.5 })
   );
   targetCube.add(grabZone); // child of the cube — inherits its position for free
+
+  // Flat ring marking the exact spot on the floor a grab actually succeeds
+  // at. Since the pinch marker's depth is only accurate ON the placement
+  // plane (see runHandDetection), and the cube floats above that plane,
+  // "aim at the cube" isn't quite the right instruction — this ring shows
+  // the real target: the floor point directly under the cube.
+  targetRing = new THREE.Mesh(
+    new THREE.RingGeometry(0.05, 0.07, 32).rotateX(-Math.PI / 2),
+    new THREE.MeshBasicMaterial({ color: 0xff33cc, side: THREE.DoubleSide })
+  );
+  targetRing.visible = false;
+  scene.add(targetRing);
+
+  // Arrow from the tracked fingertip to the target ring, redrawn every
+  // hand-detection frame. Color shifts red → green as the gap closes so
+  // it reads at a glance without needing to look at the HUD numbers.
+  guideArrow = new THREE.ArrowHelper(
+    new THREE.Vector3(0, 0, -1), // placeholder direction, updated per-frame
+    new THREE.Vector3(),
+    0.1,
+    0xff3333
+  );
+  guideArrow.visible = false;
+  scene.add(guideArrow);
 
   // Small marker showing the tracked pinch point, placed by intersecting
   // a ray from the camera through the fingertip with the real surface the
@@ -398,8 +426,33 @@ function runHandDetection(frameData, timestampMs) {
           targetCube.material.color.set(0xff5533);
           debugState.grabbed = false;
         }
+
+        // Guide arrow: fingertip → the real grab-point ring (not the cube
+        // itself — the ring is at the depth the marker can actually reach).
+        // Color runs red (far) to green (inside grab range) using the same
+        // distance-to-cube number the grab check itself uses, so the color
+        // and the HUD's "dist to cube" never disagree.
+        const arrowVec = new THREE.Vector3().subVectors(targetRing.position, handMarker.position);
+        const arrowLen = arrowVec.length();
+        if (arrowLen > 0.001) {
+          guideArrow.visible = true;
+          guideArrow.position.copy(handMarker.position);
+          guideArrow.setDirection(arrowVec.normalize());
+          guideArrow.setLength(arrowLen, Math.min(0.04, arrowLen * 0.4), Math.min(0.025, arrowLen * 0.25));
+
+          const t = THREE.MathUtils.clamp(
+            1 - (dist - GRAB_RADIUS) / (0.6 - GRAB_RADIUS), // 0 at far (0.6m), 1 at grab radius
+            0,
+            1
+          );
+          const arrowColor = new THREE.Color(0xff3333).lerp(new THREE.Color(0x33ff66), t);
+          guideArrow.setColor(arrowColor);
+        } else {
+          guideArrow.visible = false; // already basically on target
+        }
       } else {
         debugState.markerCubeDist = null;
+        guideArrow.visible = false;
       }
     } else {
       // No plane yet, or the ray from this fingertip position doesn't hit
@@ -407,6 +460,7 @@ function runHandDetection(frameData, timestampMs) {
       // misleading marker.
       handMarker.visible = false;
       debugState.markerCubeDist = null;
+      guideArrow.visible = false;
     }
   } else {
     handMarker.visible = false;
@@ -414,6 +468,7 @@ function runHandDetection(frameData, timestampMs) {
     debugState.pinching = false;
     debugState.pinchRatio = null;
     debugState.markerCubeDist = null;
+    guideArrow.visible = false;
   }
 
   updateDebugPanel();
@@ -459,6 +514,12 @@ function onXRFrame(timestamp, frame) {
       const planePoint = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
       const planeNormal = new THREE.Vector3(0, 1, 0).transformDirection(reticle.matrix);
       placementPlane = new THREE.Plane().setFromNormalAndCoplanarPoint(planeNormal, planePoint);
+
+      // The ring sits at planePoint itself — the floor point directly under
+      // the cube, which is where the marker's depth is actually accurate.
+      targetRing.position.copy(planePoint);
+      targetRing.position.y += 0.002; // tiny lift to avoid z-fighting with the floor
+      targetRing.visible = true;
     }
   }
 

@@ -4,7 +4,7 @@
 // local shell (icon, manifest, index.html) load instantly from the
 // home-screen icon, even on a flaky connection.
 
-const CACHE_NAME = "ar-pinch-shell-v2";
+const CACHE_NAME = "ar-pinch-shell-v3";
 const SHELL_FILES = [
   "./",
   "./index.html",
