@@ -78,6 +78,13 @@ let readbackCanvas, readbackCtx;
 let frameCounter = 0;
 const HAND_DETECT_EVERY_N_FRAMES = 3; // throttle the texture readback
 
+// The real-world surface the cube was placed on, captured once from the
+// hit-test pose. Used to give the pinch marker a real depth instead of a
+// guessed constant — see runHandDetection().
+let placementPlane = null;
+const handRaycaster = new THREE.Raycaster();
+const planeHitPoint = new THREE.Vector3();
+
 function log(msg) {
   statusEl.classList.remove("hidden");
   statusEl.textContent = msg;
@@ -133,8 +140,9 @@ function initScene() {
   targetCube.visible = false;
   scene.add(targetCube);
 
-  // Small marker showing the tracked pinch point, projected into 3D space
-  // in front of the camera (approximate — see notes in README below).
+  // Small marker showing the tracked pinch point, placed by intersecting
+  // a ray from the camera through the fingertip with the real surface the
+  // cube was placed on (see placementPlane / runHandDetection below).
   handMarker = new THREE.Mesh(
     new THREE.SphereGeometry(0.015, 16, 16),
     new THREE.MeshBasicMaterial({ color: 0x3388ff })
@@ -293,22 +301,42 @@ function runHandDetection(frameData, timestampMs) {
     const landmarks = result.landmarks[0];
     const pinching = isPinching(landmarks);
 
-    // Rough projection: place the marker in front of the camera based on
-    // index-tip 2D position + a fixed depth guess. Good enough to validate
-    // the pipeline; replace with a proper depth/hit-test based placement
-    // once this is working end to end.
+    // Real depth placement: cast a ray from the camera through the
+    // fingertip's screen position and intersect it with the actual surface
+    // the cube was placed on (captured as placementPlane). This replaces
+    // the earlier fixed-depth guess — the marker now lands where your
+    // finger actually is relative to the real floor, not at an arbitrary
+    // constant distance from the phone.
+    //
+    // Landmark x/y are normalized [0,1] over the raw camera texture, which
+    // the WebXR spec requires to be aligned with the XRView (same FOV) —
+    // that's what makes this NDC conversion valid. Still worth confirming
+    // on-device: if the marker feels systematically offset from your real
+    // fingertip, the likely cause is the camera texture's aspect ratio or
+    // orientation not matching the render viewport 1:1 on your phone.
     const tip = landmarks[8];
-    handMarker.visible = true;
-    handMarker.position.set((tip.x - 0.5) * 0.4, (0.5 - tip.y) * 0.4, -0.4);
-    handMarker.position.applyMatrix4(camera.matrixWorld);
-    handMarker.material.color.set(pinching ? 0x00ff00 : 0x3388ff);
+    const ndcX = tip.x * 2 - 1;
+    const ndcY = -(tip.y * 2 - 1);
 
-    if (pinching && targetCube.visible) {
-      const dist = handMarker.position.distanceTo(targetCube.position);
-      if (dist < 0.15) {
-        targetCube.material.color.set(0x00ff00);
-        log("Pinch detected near cube — grabbed!");
+    handRaycaster.setFromCamera({ x: ndcX, y: ndcY }, camera);
+
+    if (placementPlane && handRaycaster.ray.intersectPlane(placementPlane, planeHitPoint)) {
+      handMarker.visible = true;
+      handMarker.position.copy(planeHitPoint);
+      handMarker.material.color.set(pinching ? 0x00ff00 : 0x3388ff);
+
+      if (pinching && targetCube.visible) {
+        const dist = handMarker.position.distanceTo(targetCube.position);
+        if (dist < 0.15) {
+          targetCube.material.color.set(0x00ff00);
+          log("Pinch detected near cube — grabbed!");
+        }
       }
+    } else {
+      // No plane yet, or the ray from this fingertip position doesn't hit
+      // it (e.g. pointing above the horizon) — hide rather than show a
+      // misleading marker.
+      handMarker.visible = false;
     }
   } else {
     handMarker.visible = false;
@@ -333,6 +361,13 @@ function onXRFrame(timestamp, frame) {
       targetCube.position.y += 0.08;
       targetCube.visible = true;
       reticle.visible = false;
+
+      // Capture the surface itself (point + normal) so the pinch marker can
+      // later be placed by intersecting a ray with this real plane, instead
+      // of guessing a fixed depth in front of the camera.
+      const planePoint = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
+      const planeNormal = new THREE.Vector3(0, 1, 0).transformDirection(reticle.matrix);
+      placementPlane = new THREE.Plane().setFromNormalAndCoplanarPoint(planeNormal, planePoint);
     }
   }
 
