@@ -30,9 +30,18 @@
     pointer-events: none;
   }
   #dbgCanvas {
-    position: fixed; bottom: 8px; right: 8px; width: 120px; height: 90px;
+    position: fixed; bottom: 8px; right: 8px; width: 160px; height: 120px;
     border: 1px solid rgba(255,255,255,0.4); z-index: 20; background: #111;
   }
+  #debugPanel {
+    position: fixed; bottom: 8px; left: 8px; z-index: 20;
+    font-family: "SF Mono", Menlo, monospace; font-size: 11px; line-height: 1.5;
+    color: #b6ffb6; background: rgba(0,0,0,0.6); padding: 8px 10px;
+    border-radius: 6px; pointer-events: none; white-space: pre;
+  }
+  #debugPanel.hidden { display: none; }
+  #debugPanel .warn { color: #ffcc66; }
+  #debugPanel .ok { color: #66ff99; }
 </style>
 </head>
 <body>
@@ -49,6 +58,7 @@
 </div>
 
 <div id="status" class="hidden"></div>
+<div id="debugPanel" class="hidden"></div>
 <canvas id="dbgCanvas" class="hidden"></canvas>
 
 <script type="importmap">
@@ -69,6 +79,7 @@ const startBtn = document.getElementById("startBtn");
 const statusEl = document.getElementById("status");
 const dbgCanvas = document.getElementById("dbgCanvas");
 const dbgCtx = dbgCanvas.getContext("2d");
+const debugPanel = document.getElementById("debugPanel");
 
 let renderer, scene, camera, xrSession, xrRefSpace, hitTestSource;
 let reticle, targetCube, handMarker;
@@ -84,6 +95,20 @@ const HAND_DETECT_EVERY_N_FRAMES = 3; // throttle the texture readback
 let placementPlane = null;
 const handRaycaster = new THREE.Raycaster();
 const planeHitPoint = new THREE.Vector3();
+
+// Debug metrics, refreshed each frame / each hand-detection pass. Kept as
+// plain state rather than recomputed inline so the HUD and the wireframe
+// hitbox both read the same numbers the game logic actually used.
+const debugState = {
+  planeFound: false,
+  handDetected: false,
+  pinching: false,
+  pinchRatio: null,
+  markerCubeDist: null,
+  detectMs: null,
+  grabbed: false
+};
+const GRAB_RADIUS = 0.15; // keep in sync with the threshold in runHandDetection
 
 function log(msg) {
   statusEl.classList.remove("hidden");
@@ -140,6 +165,15 @@ function initScene() {
   targetCube.visible = false;
   scene.add(targetCube);
 
+  // Wireframe showing the actual grab radius (GRAB_RADIUS) around the cube.
+  // Purely a debug visual — makes the invisible hitbox the game logic uses
+  // visible in the AR view itself, not just implied by a number in the HUD.
+  const grabZone = new THREE.Mesh(
+    new THREE.SphereGeometry(GRAB_RADIUS, 16, 12),
+    new THREE.MeshBasicMaterial({ color: 0xffcc66, wireframe: true, transparent: true, opacity: 0.5 })
+  );
+  targetCube.add(grabZone); // child of the cube — inherits its position for free
+
   // Small marker showing the tracked pinch point, placed by intersecting
   // a ray from the camera through the fingertip with the real surface the
   // cube was placed on (see placementPlane / runHandDetection below).
@@ -171,7 +205,8 @@ async function initHandLandmarker() {
 
 // Pinch = distance between thumb tip (4) and index tip (8) below a threshold,
 // normalized by hand size (wrist-to-middle-mcp) so it's roughly scale-invariant.
-function isPinching(landmarks) {
+// Optionally writes the raw ratio into a debug state object for the HUD.
+function isPinching(landmarks, debugOut) {
   const thumbTip = landmarks[4];
   const indexTip = landmarks[8];
   const wrist = landmarks[0];
@@ -187,7 +222,9 @@ function isPinching(landmarks) {
   const hz = wrist.z - middleMcp.z;
   const handScale = Math.sqrt(hx * hx + hy * hy + hz * hz) || 0.1;
 
-  return pinchDist / handScale < 0.35;
+  const ratio = pinchDist / handScale;
+  if (debugOut) debugOut.pinchRatio = ratio;
+  return ratio < 0.35;
 }
 
 // --- XR session -----------------------------------------------------------
@@ -296,10 +333,33 @@ function runHandDetection(frameData, timestampMs) {
   dctx.clearRect(0, 0, dbgCanvas.width, dbgCanvas.height);
   dctx.drawImage(readbackCanvas, 0, 0, dbgCanvas.width, dbgCanvas.height);
 
+  const detectStart = performance.now();
   const result = handLandmarker.detectForVideo(readbackCanvas, timestampMs);
+  debugState.detectMs = performance.now() - detectStart;
+
   if (result.landmarks && result.landmarks.length > 0) {
     const landmarks = result.landmarks[0];
-    const pinching = isPinching(landmarks);
+    const pinching = isPinching(landmarks, debugState);
+    debugState.handDetected = true;
+    debugState.pinching = pinching;
+
+    // Draw all 21 landmarks + the thumb-index pinch line on the debug
+    // canvas, in the same normalized [0,1] space MediaPipe returns —
+    // scales directly to dbgCanvas's pixel size.
+    dctx.fillStyle = "#66ff99";
+    for (const lm of landmarks) {
+      dctx.beginPath();
+      dctx.arc(lm.x * dbgCanvas.width, lm.y * dbgCanvas.height, 2, 0, Math.PI * 2);
+      dctx.fill();
+    }
+    const thumbTip = landmarks[4];
+    const indexTip = landmarks[8];
+    dctx.strokeStyle = pinching ? "#00ff00" : "#3388ff";
+    dctx.lineWidth = 2;
+    dctx.beginPath();
+    dctx.moveTo(thumbTip.x * dbgCanvas.width, thumbTip.y * dbgCanvas.height);
+    dctx.lineTo(indexTip.x * dbgCanvas.width, indexTip.y * dbgCanvas.height);
+    dctx.stroke();
 
     // Real depth placement: cast a ray from the camera through the
     // fingertip's screen position and intersect it with the actual surface
@@ -320,27 +380,58 @@ function runHandDetection(frameData, timestampMs) {
 
     handRaycaster.setFromCamera({ x: ndcX, y: ndcY }, camera);
 
+    debugState.planeFound = !!placementPlane;
+
     if (placementPlane && handRaycaster.ray.intersectPlane(placementPlane, planeHitPoint)) {
       handMarker.visible = true;
       handMarker.position.copy(planeHitPoint);
       handMarker.material.color.set(pinching ? 0x00ff00 : 0x3388ff);
 
-      if (pinching && targetCube.visible) {
+      if (targetCube.visible) {
         const dist = handMarker.position.distanceTo(targetCube.position);
-        if (dist < 0.15) {
+        debugState.markerCubeDist = dist;
+        if (pinching && dist < GRAB_RADIUS) {
           targetCube.material.color.set(0x00ff00);
+          debugState.grabbed = true;
           log("Pinch detected near cube — grabbed!");
+        } else if (!pinching) {
+          targetCube.material.color.set(0xff5533);
+          debugState.grabbed = false;
         }
+      } else {
+        debugState.markerCubeDist = null;
       }
     } else {
       // No plane yet, or the ray from this fingertip position doesn't hit
       // it (e.g. pointing above the horizon) — hide rather than show a
       // misleading marker.
       handMarker.visible = false;
+      debugState.markerCubeDist = null;
     }
   } else {
     handMarker.visible = false;
+    debugState.handDetected = false;
+    debugState.pinching = false;
+    debugState.pinchRatio = null;
+    debugState.markerCubeDist = null;
   }
+
+  updateDebugPanel();
+}
+
+function updateDebugPanel() {
+  debugPanel.classList.remove("hidden");
+  const cls = (ok) => (ok ? "ok" : "warn");
+  const fmt = (v, digits = 2) => (v === null || v === undefined ? "—" : v.toFixed(digits));
+
+  debugPanel.innerHTML =
+    `plane:        <span class="${cls(debugState.planeFound)}">${debugState.planeFound ? "found" : "none"}</span>\n` +
+    `hand:         <span class="${cls(debugState.handDetected)}">${debugState.handDetected ? "detected" : "none"}</span>\n` +
+    `pinch ratio:  ${fmt(debugState.pinchRatio, 3)}  (grab < 0.35)\n` +
+    `pinching:     <span class="${cls(debugState.pinching)}">${debugState.pinching}</span>\n` +
+    `dist to cube: ${fmt(debugState.markerCubeDist)} m  (grab < ${GRAB_RADIUS} m)\n` +
+    `grabbed:      <span class="${cls(debugState.grabbed)}">${debugState.grabbed}</span>\n` +
+    `detect time:  ${fmt(debugState.detectMs, 1)} ms`;
 }
 
 function onXRFrame(timestamp, frame) {
